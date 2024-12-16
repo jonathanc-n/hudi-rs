@@ -153,7 +153,9 @@ pub struct FileGroup {
 
 impl PartialEq for FileGroup {
     fn eq(&self, other: &Self) -> bool {
-        self.id == other.id && self.partition_path == other.partition_path
+        let self_partition = self.partition_path.as_deref().unwrap_or("");
+        let other_partition = other.partition_path.as_deref().unwrap_or("");
+        self.id == other.id && self_partition == other_partition
     }
 }
 

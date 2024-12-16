@@ -219,6 +219,75 @@ impl Timeline {
 
         Ok(fgs)
     }
+
+    pub fn get_incremental_instants(
+        &self,
+        start_timestamp: &str,
+        end_timestamp: Option<&str>,
+    ) -> Result<HashSet<FileGroup>> {
+        println!("getting incremental instant");
+        let end_ts = end_timestamp
+            .or_else(|| self.get_latest_commit_timestamp())
+            .ok_or_else(|| CoreError::Timeline("No commits available".to_string()))?;
+
+        let relevant_instants: Vec<&Instant> = self
+            .instants
+            .iter()
+            .filter(|instant| {
+                (instant.timestamp > start_timestamp.to_string())
+                    && (instant.timestamp <= end_ts.to_string())
+            })
+            .collect();
+
+        let mut fgs: HashSet<FileGroup> = HashSet::new();
+
+        for instant in relevant_instants {
+            let commit_metadata = futures::executor::block_on(self.get_commit_metadata(instant))?;
+            if instant.is_replacecommit() {
+                if let Some(ptn_to_replaced) = commit_metadata.get("partitionToReplaceFileIds") {
+                    for (ptn, fg_ids) in ptn_to_replaced
+                        .as_object()
+                        .expect("partitionToReplaceFileIds should be a map")
+                    {
+                        let fg_ids = fg_ids
+                            .as_array()
+                            .expect("file group ids should be an array")
+                            .iter()
+                            .map(|fg_id| fg_id.as_str().expect("file group id should be a string"));
+
+                        let ptn = Some(ptn.to_string()).filter(|s| !s.is_empty());
+
+                        for fg_id in fg_ids {
+                            fgs.insert(FileGroup::new(fg_id.to_string(), ptn.clone()));
+                        }
+                    }
+                }
+            } else {
+                // For normal commits, we can infer changed file groups from partitionToWriteStats.
+                // Each entry in partitionToWriteStats corresponds to a partition -> array of WriteStats.
+                // Each WriteStat typically contains a fileId and path, from which we can deduce the FileGroup.
+                if let Some(ptn_to_stats) = commit_metadata.get("partitionToWriteStats") {
+                    let ptn_to_stats = ptn_to_stats
+                        .as_object()
+                        .expect("partitionToWriteStats should be a map");
+                    for (ptn, stats_arr) in ptn_to_stats {
+                        let stats_arr = stats_arr
+                            .as_array()
+                            .expect("write stats should be an array");
+                        let ptn = Some(ptn.to_string()).filter(|s| !s.is_empty());
+
+                        for stat_val in stats_arr {
+                            if let Some(file_id) = stat_val.get("fileId").and_then(|v| v.as_str()) {
+                                fgs.insert(FileGroup::new(file_id.to_string(), ptn.clone()));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        Ok(fgs)
+    }
 }
 
 #[cfg(test)]

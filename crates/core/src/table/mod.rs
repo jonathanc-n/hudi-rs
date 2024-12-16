@@ -276,16 +276,67 @@ impl Table {
         Ok(batches)
     }
 
-    /// Get records that were inserted or updated between the given timestamps. Records that were updated multiple times should have their latest states within the time span being returned.
+    /// Get records that were inserted or updated between the given timestamps. Records that were
+    /// updated multiple times should have their latest states within the time span being returned.
     pub async fn read_incremental_records(
         &self,
-        _start_timestamp: &str,
-        _end_timestamp: Option<&str>,
+        start_timestamp: &str,
+        mut end_timestamp: Option<&str>,
+        filters: &[Filter],
     ) -> Result<Vec<RecordBatch>> {
-        todo!("read_incremental_states")
+        let current_timestamp = self.timeline.get_latest_commit_timestamp().unwrap();
+        let partition_schema = self.get_partition_schema().await?;
+
+        if start_timestamp == current_timestamp {
+            return self.read_snapshot_as_of(start_timestamp, filters).await;
+        }
+
+        if end_timestamp.is_none() {
+            end_timestamp = Some(current_timestamp);
+        }
+
+        let start_filter =
+            Filter::try_from(("_hoodie_commit_timestamp", ">", start_timestamp)).unwrap();
+        let end_filter =
+            Filter::try_from(("_hoodie_commit_timestamp", "<=", current_timestamp)).unwrap();
+        let mut new_filters = filters.to_vec();
+        new_filters.push(start_filter);
+        new_filters.push(end_filter);
+
+        if Some(end_timestamp) == None {
+            end_timestamp = Some(current_timestamp);
+        }
+
+        let excludes = self.timeline.get_replaced_file_groups().await?;
+        let file_group = self
+            .timeline
+            .get_incremental_instants(start_timestamp, end_timestamp)?;
+        for i in file_group.iter() {
+            println!("ID OF FILE GROUP: {}", i.id);
+        }
+
+        let partition_pruner =
+            PartitionPruner::new(filters, &partition_schema, self.hudi_configs.as_ref())?;
+
+        let end_ts = end_timestamp.unwrap();
+        let file_slices = self
+            .file_system_view
+            .collect_incremental_file_slices_as_of(&file_group, &partition_pruner, &excludes, end_ts)
+            .await?;
+
+        for i in file_slices.iter() {
+            println!("{}", i.base_file.file_group_id);
+        }
+
+        let fg_reader = self.create_file_group_reader();
+        let batches =
+            futures::future::try_join_all(file_slices.iter().map(|f| fg_reader.read_file_slice(f)))
+                .await?;
+        Ok(batches)
     }
 
-    /// Get the change-data-capture (CDC) records between the given timestamps. The CDC records should reflect the records that were inserted, updated, and deleted between the timestamps.
+    /// Get the change-data-capture (CDC) records between the given timestamps. The CDC records should
+    /// reflect the records that were inserted, updated, and deleted between the timestamps.
     pub async fn read_incremental_changes(
         &self,
         _start_timestamp: &str,
@@ -858,4 +909,154 @@ mod tests {
         ]);
         assert_eq!(actual_file_names, expected_file_names);
     }
+
+    #[tokio::test]
+    async fn test_hudi_table_read_incremental_records() {
+        let base_url = TestTable::V6Nonpartitioned.url();
+
+        let hudi_table = Table::new(base_url.path()).await.unwrap();
+
+        let start_timestamp = "20240418173551905";
+        let end_timestamp = "20240418173551906";
+
+        let batches = hudi_table
+            .read_incremental_records(start_timestamp, Some(end_timestamp), &[])
+            .await
+            .expect("Failed to read incremental records");
+
+        let total_rows: usize = batches.iter().map(|batch| batch.num_rows()).sum();
+        assert_eq!(
+            total_rows, 4
+        );
+    }
+
+    fn print_record_batch(batch: &RecordBatch, batch_idx: usize) {
+        println!("--- RecordBatch {} ---", batch_idx + 1);
+    
+        // Extract columns as needed
+        let commit_time_col = batch.column_by_name("_hoodie_commit_time");
+        let record_key_col = batch.column_by_name("_hoodie_record_key");
+        let name_col = batch.column_by_name("name");
+    
+        // Handle missing columns
+        if commit_time_col.is_none() || record_key_col.is_none() || name_col.is_none() {
+            println!("Missing one or more required columns in RecordBatch {}", batch_idx + 1);
+            return;
+        }
+    
+        let commit_times = commit_time_col
+            .unwrap()
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .expect("Failed to downcast _hoodie_commit_time to StringArray");
+    
+        let record_keys = record_key_col
+            .unwrap()
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .expect("Failed to downcast _hoodie_record_key to StringArray");
+    
+        let names = name_col
+            .unwrap()
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .expect("Failed to downcast 'name' to StringArray");
+    
+        for row_idx in 0..batch.num_rows() {
+            let commit_time = commit_times.value(row_idx);
+            let record_key = record_keys.value(row_idx);
+            let name = names.value(row_idx);
+    
+            println!(
+                "Row {}: commit_time = {}, record_key = {}, name = {}",
+                row_idx + 1,
+                commit_time,
+                record_key,
+                name
+            );
+        }
+    }
+    
+
+    #[tokio::test]
+async fn test_hudi_table_read_incremental_records_full_snapshot() {
+    let base_url = TestTable::V6Nonpartitioned.url();
+    let hudi_table = Table::new(base_url.path()).await.unwrap();
+
+    let start_timestamp = "0";
+    let end_timestamp = "20240418173551906";
+
+    let batches = hudi_table
+        .read_incremental_records(start_timestamp, Some(end_timestamp), &[])
+        .await
+        .expect("Failed to read incremental records");
+
+    // Print all records with their timestamps for debugging
+    println!("=== Incremental Read (Full Snapshot) Results ===");
+    for (batch_idx, batch) in batches.iter().enumerate() {
+        print_record_batch(batch, batch_idx);
+    }
+    println!("=== End of Incremental Read (Full Snapshot) Results ===");
+
+    // Calculate the total number of rows
+    let total_rows: usize = batches.iter().map(|batch| batch.num_rows()).sum();
+    assert_eq!(
+        total_rows, 4,
+        "Expected 4 rows in incremental read results, but found {}",
+        total_rows
+    );
+}
+
+
+    #[tokio::test]
+async fn test_hudi_table_read_incremental_records_start_to_mid() {
+    let base_url = TestTable::V6Nonpartitioned.url();
+    let hudi_table = Table::new(base_url.path()).await.unwrap();
+
+    let start_timestamp = "0";
+    let end_timestamp = "20240418173550988";
+
+    let batches = hudi_table
+        .read_incremental_records(start_timestamp, Some(end_timestamp), &[])
+        .await
+        .expect("Failed to read incremental records");
+
+    // Print all records with their timestamps for debugging
+    println!("=== Incremental Read (Start to Mid) Results ===");
+    for (batch_idx, batch) in batches.iter().enumerate() {
+        print_record_batch(batch, batch_idx);
+    }
+    println!("=== End of Incremental Read (Start to Mid) Results ===");
+
+    // Calculate the total number of rows
+    let total_rows: usize = batches.iter().map(|batch| batch.num_rows()).sum();
+    assert_eq!(
+        total_rows, 2,
+        "Expected 2 rows in incremental read results (Bob and Carol), but found {}",
+        total_rows
+    );
+
+    // Optional: Verify specific records
+    let mut expected_records = HashSet::new();
+    expected_records.insert(("2", "Bob"));
+    expected_records.insert(("3", "Carol"));
+
+    for batch in &batches {
+        let record_key_col = batch.column_by_name("_hoodie_record_key").unwrap().as_any().downcast_ref::<StringArray>().unwrap();
+        let name_col = batch.column_by_name("name").unwrap().as_any().downcast_ref::<StringArray>().unwrap();
+
+        for row_idx in 0..batch.num_rows() {
+            let record_key = record_key_col.value(row_idx);
+            let name = name_col.value(row_idx);
+            assert!(
+                expected_records.contains(&(record_key, name)),
+                "Unexpected record: record_key = {}, name = {}",
+                record_key,
+                name
+            );
+        }
+    }
+}
+
+
 }

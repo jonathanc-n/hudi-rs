@@ -174,6 +174,112 @@ impl FileSystemView {
         }
         Ok(file_slices)
     }
+
+    pub async fn collect_incremental_file_slices_as_of(
+        &self,
+        file_group: &HashSet<FileGroup>,
+        partition_pruner: &PartitionPruner,
+        excluding_file_groups: &HashSet<FileGroup>,
+        end_timestamp: &str,
+    ) -> Result<Vec<FileSlice>> {
+        for i in file_group.iter() {
+            println!("file_ group: {}", i.id);
+        }
+        let mut needed_partitions: HashSet<String> = HashSet::new();
+        for fg in file_group.iter() {
+            let partition = fg.partition_path.clone().unwrap_or_default();
+            println!("{}", partition);
+            if partition_pruner.should_include(&partition) {
+                println!("inserted {}", partition);
+                needed_partitions.insert(partition);
+            }
+        }
+
+        let all_partition_paths = Self::load_all_partition_paths(&self.storage).await?;
+        let partition_paths_to_load = all_partition_paths
+            .into_iter()
+            .filter(|p| needed_partitions.contains(p))
+            .filter(|p| !self.partition_to_file_groups.contains_key(p))
+            .collect::<HashSet<_>>();
+
+        for har in partition_paths_to_load.iter() {
+            println!("inserted {}", har);
+        }
+
+        stream::iter(partition_paths_to_load)
+            .map(|path| async move {
+                println!("Loading file groups for partition: {}", path);
+                let file_groups =
+                    Self::load_file_groups_for_partition(&self.storage, &path).await?;
+                println!("Loaded {} file groups for partition: {}", file_groups.len(), path);
+                Ok::<_, CoreError>((path, file_groups))
+            })
+            .buffer_unordered(10)
+            .try_for_each(|(path, file_groups)| async move {
+                println!("Inserting {} file groups for partition: {}", file_groups.len(), path);
+                self.partition_to_file_groups.insert(path, file_groups);
+                Ok(())
+            })
+            .await?;
+
+        let mut file_slices = Vec::new();
+        println!("Iterating over {} file groups from input", file_group.len());
+
+        for fg in file_group.iter() {
+            println!("Processing file group: id = {}, partition_path = {:?}",
+                     fg.id, fg.partition_path);
+            
+            if excluding_file_groups.contains(fg) {
+                println!("Excluded file group: {}", fg.id);
+                continue;
+            }
+        
+            let partition_path = fg.partition_path.clone().unwrap_or_default();
+            println!("Partition path for {} is '{}'", fg.id, partition_path);
+        
+            if partition_pruner.should_include(&partition_path) {
+                println!("Partition '{}' is included by the pruner", partition_path);
+                if let Some(mut partition_entry) = self.partition_to_file_groups.get_mut(&partition_path) {
+                    let file_groups = partition_entry.value_mut();
+                    println!("Found {} file groups in partition '{}'", file_groups.len(), partition_path);
+        
+                    // Try to find the matching file group
+                    if let Some(found_fg) = file_groups.iter_mut().find(|g| **g == *fg) {
+                        println!("Found matching file group {} in partition '{}'", fg.id, partition_path);
+                        if let Some(fsl) = found_fg.get_file_slice_mut_as_of(&end_timestamp) {
+                            println!(
+                                "Found file slice for file group {} as of {}: base_file_id={}",
+                                fg.id,
+                                end_timestamp,
+                                fsl.base_file.file_group_id
+                            );
+                            fsl.load_stats(&self.storage).await?;
+                            file_slices.push(fsl.clone());
+                        } else {
+                            println!(
+                                "No file slice found for file group {} at timestamp {}",
+                                fg.id, end_timestamp
+                            );
+                        }
+                    } else {
+                        println!(
+                            "No matching file group {} found in partition '{}'",
+                            fg.id, partition_path
+                        );
+                    }
+                } else {
+                    println!("No entry found in partition_to_file_groups for '{}'", partition_path);
+                }
+            } else {
+                println!("Partition '{}' is excluded by the pruner", partition_path);
+            }
+        }
+        for i in file_slices.iter() {
+            println!("{}", i.base_file.file_group_id);
+        }
+
+        Ok(file_slices)
+    }
 }
 
 #[cfg(test)]
